@@ -15,7 +15,7 @@
 		<relativePath/>
 	</parent>
 
-	<!-- Component Version Properties * -->
+	<!-- Component Version Properties ** -->
 	<properties>
 		<spring.version>4.3.10.RELEASE</spring.version>
 		<springboot.version>2.3.1.RELEASE</springboot.version>
