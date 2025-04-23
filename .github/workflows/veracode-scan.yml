@@ -1,0 +1,45 @@
+name: Scheduled and Event-Based Static Scan
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"  # Runs at midnight on the 1st day of every month
+  workflow_dispatch:       # Allows manual triggering of the workflow
+  push:                    # Trigger on any push
+    branches:
+      - '**'               # Include all branches
+  pull_request:            # Trigger on any pull request
+    branches:
+      - '**'               # Include all branches
+
+jobs:
+  veracode_upload_and_scan:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: Zip the entire repository
+      - name: Zip the entire repository
+        run: |
+          zip -r repo.zip . -x "*.git*" "*.github/workflows/*"
+
+      # Step 3: List contents of the zip file (optional, for debugging)
+      - name: List contents of zip
+        run: unzip -l repo.zip
+
+      # Step 4: Veracode Upload And Scan
+      - name: Veracode Upload And Scan
+        uses: veracode/veracode-uploadandscan-action@0.2.6
+        with:
+          appname:            ${{ github.event.repository.name }}
+          filepath:           repo.zip
+          version:            ${{ github.run_id }}
+          vid:                ${{ secrets.VERACODE_API_ID }}
+          vkey:               ${{ secrets.VERACODE_API_KEY }}
+          criticality: 'Low'            # Set the criticality of the scan
+          scantimeout:        120       # wait up to 2 hours
+          scanpollinginterval:60        # poll every 60 s
+          deleteincompletescan: false   # do not delete; just wait
