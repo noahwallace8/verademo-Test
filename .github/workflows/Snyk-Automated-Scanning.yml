@@ -533,7 +533,7 @@ jobs:
                 
                 # Generate a valid image name (handle root directory case)
                 if [ "$dockerfile_dir" = "." ]; then
-                  image_name="snyk-test-root"
+                  image_name="snyk-container-scan"
                 else
                   image_name="snyk-test-$(echo "$dockerfile_dir" | tr '/' '-' | tr ' ' '-' | sed 's/^\.-//')"
                 fi
