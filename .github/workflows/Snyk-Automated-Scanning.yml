@@ -554,6 +554,8 @@ jobs:
                   echo "Step 2: Running Snyk container test on built image..."
                   snyk container test "$image_name:latest" \
                     --file="$dockerfile" \
+                    --target-reference="$branch" \
+                    --project-tags="repo=$REPO_NAME,branch=$branch" \
                     --severity-threshold=low \
                     --report \
                     --project-name="$PROJECT_NAME Container Image - $dockerfile" || {
@@ -564,6 +566,8 @@ jobs:
                   echo "Step 3: Running Snyk container monitor on built image..."
                   snyk container monitor "$image_name:latest" \
                     --file="$dockerfile" \
+                    --target-reference="$branch" \
+                    --project-tags="repo=$REPO_NAME,branch=$branch" \
                     --project-name="$PROJECT_NAME Container Image - $dockerfile" || {
                     echo "Warning: Snyk container monitor on built image failed."
                   }
@@ -589,6 +593,8 @@ jobs:
                         # Scan the base image
                         snyk container test "$base_image" \
                           --file="$dockerfile" \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --severity-threshold=low \
                           --report \
                           --project-name="$PROJECT_NAME Container Base - $dockerfile" || {
@@ -599,6 +605,8 @@ jobs:
                         echo "Step 4: Running Snyk container monitor on base image..."
                         snyk container monitor "$base_image" \
                           --file="$dockerfile" \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --project-name="$PROJECT_NAME Container Base - $dockerfile" || {
                           echo "Warning: Snyk container monitor on base image failed."
                         }
@@ -627,6 +635,8 @@ jobs:
                             echo "Scanning alternative base image for vulnerabilities..."
                             snyk container test "$alternative_image" \
                               --file="$dockerfile" \
+                              --target-reference="$branch" \
+                              --project-tags="repo=$REPO_NAME,branch=$branch" \
                               --severity-threshold=low \
                               --report \
                               --project-name="$PROJECT_NAME Container Base (Alt) - $dockerfile" || {
@@ -635,6 +645,8 @@ jobs:
                             
                             snyk container monitor "$alternative_image" \
                               --file="$dockerfile" \
+                              --target-reference="$branch" \
+                              --project-tags="repo=$REPO_NAME,branch=$branch" \
                               --project-name="$PROJECT_NAME Container Base (Alt) - $dockerfile" || {
                               echo "Warning: Snyk container monitor on alternative base image failed."
                             }
@@ -695,19 +707,27 @@ jobs:
                       echo "Running Snyk container test for service $service ($image_tag)..."
                       if [ -n "$dockerfile_arg" ]; then
                         snyk container test "$image_tag" $dockerfile_arg \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --severity-threshold=medium \
                           --report \
                           --project-name="$PROJECT_NAME Container - $service" || true
                         
                         snyk container monitor "$image_tag" $dockerfile_arg \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --project-name="$PROJECT_NAME Container - $service" || true
                       else
                         snyk container test "$image_tag" \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --severity-threshold=medium \
                           --report \
                           --project-name="$PROJECT_NAME Container - $service" || true
                         
                         snyk container monitor "$image_tag" \
+                          --target-reference="$branch" \
+                          --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --project-name="$PROJECT_NAME Container - $service" || true
                       fi
                     fi
@@ -730,11 +750,15 @@ jobs:
               
               echo "Running Snyk container test for $archive_type:$archive..."
               snyk container test "$archive_type:$archive" \
+                --target-reference="$branch" \
+                --project-tags="repo=$REPO_NAME,branch=$branch" \
                 --severity-threshold=medium \
                 --report \
                 --project-name="$PROJECT_NAME Container Archive - $(basename $archive)" || true
               
               snyk container monitor "$archive_type:$archive" \
+                --target-reference="$branch" \
+                --project-tags="repo=$REPO_NAME,branch=$branch" \
                 --project-name="$PROJECT_NAME Container Archive - $(basename $archive)" || true
             done
             
