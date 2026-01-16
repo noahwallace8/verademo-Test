@@ -1,0 +1,780 @@
+# Workflow Name: Defines the name that appears in GitHub Actions UI
+name: Snyk Security Scan (All Branches)
+
+# Trigger Configuration: Defines when this workflow runs
+on:
+  # Scheduled trigger: Runs every Sunday at 8:00 AM UTC (cron format: minute hour day-of-month month day-of-week)
+  schedule:
+    - cron: "0 8 * * 0"
+  # Manual trigger: Allows running this workflow manually from GitHub Actions UI
+  workflow_dispatch:
+
+# Permissions: Defines what GitHub token permissions this workflow needs
+permissions:
+  contents: read  # Only needs read access to repository contents
+
+# Job Definition: Single job that performs all scanning operations
+jobs:
+  snyk-security-scan:
+    runs-on: ubuntu-latest  # Uses Ubuntu runner for Linux-based scanning
+
+    steps:
+      # Step 1: Checkout repository code with full git history for all branches
+      # This is required to access and checkout different branches later
+      - name: Checkout code (all branches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for all branches (needed to access all remote branches)
+
+      # Step 2: Set up Node.js environment
+      # Node.js is required because Snyk CLI is installed via npm
+      # The version set here is a default; it may be overridden per-branch if detected in project files
+      - name: Set up Node.js (for Snyk CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'  # Default Node.js version, will be overridden per branch if detected in .nvmrc or package.json
+
+      # Step 3: Install Snyk CLI globally using npm
+      # This installs the Snyk command-line tool that performs all security scans
+      - name: Install Snyk CLI
+        id: install-snyk-cli
+        run: |
+          npm install -g snyk
+
+      # Step 4: Set up Docker Buildx
+      # Buildx is needed to build Docker container images from Dockerfiles for container scanning
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 5: Main scanning step - Iterates through all active branches and performs security scans
+      # This is a large bash script that handles branch discovery, dependency detection, and multiple scan types
+      - name: Scan all branches
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}  # Authentication token for Snyk API (stored as GitHub secret)
+          REPO_NAME: ${{ github.repository }}  # Repository name in format "owner/repo-name"
+        run: |
+          # Sub-step 5.1: Fetch all remote branches from origin
+          # This ensures we have the latest information about all branches in the repository
+          git fetch --all
+          
+          # Sub-step 5.2: Extract list of all remote branch names
+          # Filters out HEAD reference, removes "origin/" prefix, trims whitespace, and sorts uniquely
+          branches=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | sort -u)
+          
+          # Sub-step 5.3: Calculate the cutoff date (30 days ago) as Unix timestamp
+          # Branches with last commit older than this will be skipped as "dormant"
+          CUTOFF_DATE=$(date -d "30 days ago" +%s)
+          
+          # Sub-step 5.4: Main loop - Process each branch one by one
+          # Each iteration: checks if branch is active, checks out the branch, detects dependencies, installs tools, and runs scans
+          for branch in $branches; do
+            # Branch processing: Start processing this specific branch
+            echo "========================================="
+            echo "Checking branch: $branch"
+            echo "========================================="
+            
+            # Get the last commit date for this branch as Unix timestamp (seconds since epoch)
+            # This allows numeric comparison to determine if branch is dormant
+            LAST_COMMIT_DATE=$(git log -1 --format=%ct "origin/$branch" 2>/dev/null)
+            
+            # Skip branch if we cannot retrieve its commit date (branch may not exist or have no commits)
+            if [ -z "$LAST_COMMIT_DATE" ]; then
+              echo "Skipping $branch: Unable to get commit date"
+              echo ""
+              continue  # Move to next branch in loop
+            fi
+            
+            # Check if branch is dormant (last commit older than 30 days cutoff)
+            # If dormant, skip scanning to save resources on inactive branches
+            if [ "$LAST_COMMIT_DATE" -lt "$CUTOFF_DATE" ]; then
+              LAST_COMMIT_READABLE=$(git log -1 --format=%cd --date=short "origin/$branch" 2>/dev/null)
+              echo "Skipping $branch: Last commit was on $LAST_COMMIT_READABLE (dormant >30 days)"
+              echo ""
+              continue  # Move to next branch in loop
+            fi
+            
+            # Branch is active (has commits within last 30 days), proceed with scanning
+            # Log branch status and last commit date for visibility in workflow logs
+            LAST_COMMIT_READABLE=$(git log -1 --format=%cd --date=short "origin/$branch" 2>/dev/null)
+            echo "Branch $branch is active (last commit: $LAST_COMMIT_READABLE). Proceeding with scan..."
+            echo ""
+            
+            # Checkout the branch to working directory
+            # -f flag forces checkout even if there are uncommitted changes
+            # If checkout fails, skip to next branch
+            git checkout -f "$branch" || continue
+            
+            # ============================================
+            # SECTION: Comprehensive Dependency Detection and Installation
+            # This section detects all Snyk-supported programming languages and package managers
+            # by checking for characteristic manifest files, then installs the necessary build tools
+            # Detects: Node.js, Java, Python, .NET, Go, PHP, Ruby, Rust, Swift
+            # ============================================
+            echo "========================================="
+            echo "Detecting dependencies for branch: $branch"
+            echo "========================================="
+            
+            # Initialize boolean flags to track which language ecosystems are detected
+            # These flags determine which dependencies need to be installed later
+            NEEDS_NODE=false      # Node.js/JavaScript/npm/yarn/pnpm
+            NEEDS_JAVA=false      # Java/Maven/Gradle/sbt
+            NEEDS_PYTHON=false    # Python/pip/pipenv/poetry/conda
+            NEEDS_DOTNET=false    # .NET/NuGet
+            NEEDS_GO=false        # Go modules
+            NEEDS_PHP=false       # PHP/Composer
+            NEEDS_RUBY=false      # Ruby/Bundler/Gem
+            NEEDS_RUST=false      # Rust/Cargo
+            NEEDS_SWIFT=false     # Swift/Package Manager (macOS only, won't work on Linux)
+            
+            # Detect Node.js/JavaScript projects
+            # Checks for presence of Node.js manifest files to determine if this is a JavaScript project
+            if [ -f package.json ] || [ -f yarn.lock ] || [ -f pnpm-lock.yaml ] || [ -f package-lock.json ]; then
+              NEEDS_NODE=true  # Set flag to install Node.js dependencies later
+              echo "✓ Detected: Node.js/JavaScript project"
+              
+              # Detect specific Node.js version required by the project
+              # Checks multiple files in order of preference: .nvmrc, .node-version, package.json engines field
+              NODE_VERSION=""
+              if [ -f .nvmrc ]; then
+                # .nvmrc file specifies Node.js version (may have 'v' prefix, which we remove)
+                NODE_VERSION=$(cat .nvmrc | tr -d 'v' | xargs)
+                echo "  Node.js version from .nvmrc: $NODE_VERSION"
+              elif [ -f .node-version ]; then
+                # Alternative version file format
+                NODE_VERSION=$(cat .node-version | tr -d 'v' | xargs)
+                echo "  Node.js version from .node-version: $NODE_VERSION"
+              elif [ -f package.json ]; then
+                # Try to extract from package.json engines.node field (preferred method: using jq if available)
+                if command -v node &> /dev/null && command -v jq &> /dev/null; then
+                  NODE_VERSION=$(jq -r '.engines.node // empty' package.json 2>/dev/null | sed 's/[^0-9.]//g' | head -c 4)
+                elif grep -q '"engines"' package.json; then
+                  # Fallback: use grep to extract version from engines field if jq not available
+                  NODE_VERSION=$(grep -A 2 '"engines"' package.json | grep -oP '"node"\s*:\s*"[^"]*"' | grep -oP '\d+\.\d+' | head -1)
+                fi
+                if [ -n "$NODE_VERSION" ]; then
+                  echo "  Node.js version from package.json: $NODE_VERSION"
+                fi
+              fi
+              
+              # Install/switch to the detected Node.js version if it differs from default (20)
+              # Uses 'n' version manager to install specific Node.js versions
+              if [ -n "$NODE_VERSION" ] && [ "$NODE_VERSION" != "20" ]; then
+                echo "  Installing Node.js $NODE_VERSION..."
+                # Install 'n' version manager if not already available
+                if ! command -v n &> /dev/null; then
+                  npm install -g n
+                fi
+                # Install the specific Node.js version (or warn if installation fails)
+                n "$NODE_VERSION" || echo "  Warning: Could not install Node.js $NODE_VERSION, using default"
+              fi
+              
+              # Detect which package manager is being used (yarn, pnpm, or npm)
+              # Each has different lock files, so we check for those to determine the manager
+              if [ -f yarn.lock ]; then
+                echo "  Package manager: Yarn"
+                # Install Yarn globally if not available
+                if ! command -v yarn &> /dev/null; then
+                  npm install -g yarn
+                fi
+              elif [ -f pnpm-lock.yaml ]; then
+                echo "  Package manager: pnpm"
+                # Install pnpm globally if not available
+                if ! command -v pnpm &> /dev/null; then
+                  npm install -g pnpm
+                fi
+              else
+                # Default to npm (which should already be available with Node.js)
+                echo "  Package manager: npm"
+              fi
+            fi
+            
+            # Detect Java projects (Maven, Gradle)
+            if [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ] || [ -f gradlew ] || [ -f build.sbt ]; then
+              NEEDS_JAVA=true
+              echo "✓ Detected: Java project"
+              
+              # Detect Java version
+              JAVA_VERSION=""
+              JAVA_DISTRIBUTION="temurin"
+              
+              if [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+                echo "  Build tool: Gradle"
+                # Check gradle.properties first
+                if [ -f gradle.properties ]; then
+                  JAVA_VERSION=$(grep -i "javaVersion\|java.version" gradle.properties | head -1 | grep -oP '\d+' | head -1)
+                  if [ -n "$JAVA_VERSION" ]; then
+                    echo "  Java version from gradle.properties: $JAVA_VERSION"
+                  fi
+                fi
+                
+                # Check build.gradle for sourceCompatibility or java toolchain
+                if [ -z "$JAVA_VERSION" ] && [ -f build.gradle ]; then
+                  JAVA_VERSION=$(grep -i "sourceCompatibility\|java.toolchain.languageVersion" build.gradle | head -1 | grep -oP '\d+' | head -1)
+                  if [ -n "$JAVA_VERSION" ]; then
+                    echo "  Java version from build.gradle: $JAVA_VERSION"
+                  fi
+                fi
+                
+                # Check for Java distribution preference
+                if [ -f gradle.properties ]; then
+                  if grep -qi "adopt\|adoptium\|temurin" gradle.properties; then
+                    JAVA_DISTRIBUTION="temurin"
+                  elif grep -qi "zulu" gradle.properties; then
+                    JAVA_DISTRIBUTION="zulu"
+                  elif grep -qi "amazon" gradle.properties; then
+                    JAVA_DISTRIBUTION="amazon"
+                  fi
+                fi
+                
+                # Make gradlew executable
+                if [ -f gradlew ]; then
+                  chmod +x gradlew
+                  echo "  Made gradlew executable"
+                fi
+              elif [ -f pom.xml ]; then
+                echo "  Build tool: Maven"
+                JAVA_VERSION=$(grep -i "<maven.compiler.source\|<java.version>" pom.xml | head -1 | grep -oP '\d+' | head -1)
+                if [ -n "$JAVA_VERSION" ]; then
+                  echo "  Java version from pom.xml: $JAVA_VERSION"
+                fi
+              elif [ -f build.sbt ]; then
+                echo "  Build tool: sbt (Scala)"
+                JAVA_VERSION=$(grep -i "javaVersion\|scalaVersion" build.sbt | head -1 | grep -oP '\d+' | head -1)
+                if [ -n "$JAVA_VERSION" ]; then
+                  echo "  Java version from build.sbt: $JAVA_VERSION"
+                fi
+              fi
+              
+              # Install Java if needed
+              if [ -n "$JAVA_VERSION" ]; then
+                echo "  Installing Java $JAVA_VERSION ($JAVA_DISTRIBUTION)..."
+                # Use setup-java action via GitHub Actions API (if available) or SDKMAN
+                if [ -n "$GITHUB_ACTIONS" ]; then
+                  # In GitHub Actions, we can use the setup-java action
+                  # For now, check if Java is already installed with correct version
+                  CURRENT_JAVA=$(java -version 2>&1 | head -1 | grep -oP 'version "(\d+)' | grep -oP '\d+' || echo "")
+                  if [ "$CURRENT_JAVA" != "$JAVA_VERSION" ]; then
+                    echo "  Java $JAVA_VERSION needed but not available. Installing via SDKMAN..."
+                    curl -s "https://get.sdkman.io" | bash || true
+                    source "$HOME/.sdkman/bin/sdkman-init.sh" 2>/dev/null || true
+                    if command -v sdk &> /dev/null; then
+                      sdk install java "${JAVA_VERSION}.0-tem" || sdk install java "${JAVA_VERSION}.0.0-tem" || echo "  Warning: Could not install Java $JAVA_VERSION"
+                    fi
+                  fi
+                fi
+              fi
+            fi
+            
+            # Detect Python projects
+            if [ -f requirements.txt ] || [ -f Pipfile ] || [ -f poetry.lock ] || [ -f pyproject.toml ] || [ -f setup.py ] || [ -f environment.yml ] || [ -f conda.yml ]; then
+              NEEDS_PYTHON=true
+              echo "✓ Detected: Python project"
+              
+              # Detect Python version
+              PYTHON_VERSION=""
+              if [ -f .python-version ]; then
+                PYTHON_VERSION=$(cat .python-version | xargs)
+                echo "  Python version from .python-version: $PYTHON_VERSION"
+              elif [ -f runtime.txt ]; then
+                PYTHON_VERSION=$(grep -i python runtime.txt | grep -oP '\d+\.\d+' | head -1)
+                if [ -n "$PYTHON_VERSION" ]; then
+                  echo "  Python version from runtime.txt: $PYTHON_VERSION"
+                fi
+              elif [ -f pyproject.toml ]; then
+                PYTHON_VERSION=$(grep -i "requires-python\|python_version" pyproject.toml | head -1 | grep -oP '\d+\.\d+' | head -1)
+                if [ -n "$PYTHON_VERSION" ]; then
+                  echo "  Python version from pyproject.toml: $PYTHON_VERSION"
+                fi
+              fi
+              
+              # Install Python if needed
+              if [ -n "$PYTHON_VERSION" ]; then
+                echo "  Installing Python $PYTHON_VERSION..."
+                # Use deadsnakes PPA or pyenv
+                sudo apt-get update -qq || true
+                sudo apt-get install -y "python${PYTHON_VERSION}" "python${PYTHON_VERSION}-dev" "python${PYTHON_VERSION}-venv" || echo "  Warning: Could not install Python $PYTHON_VERSION"
+              fi
+              
+              # Detect package manager
+              if [ -f Pipfile ]; then
+                echo "  Package manager: pipenv"
+                if ! command -v pipenv &> /dev/null; then
+                  pip install pipenv || true
+                fi
+              elif [ -f poetry.lock ] || [ -f pyproject.toml ]; then
+                echo "  Package manager: poetry"
+                if ! command -v poetry &> /dev/null; then
+                  pip install poetry || true
+                fi
+              elif [ -f environment.yml ] || [ -f conda.yml ]; then
+                echo "  Package manager: conda"
+                if ! command -v conda &> /dev/null; then
+                  echo "  Warning: Conda not available, install manually if needed"
+                fi
+              else
+                echo "  Package manager: pip"
+              fi
+            fi
+            
+            # Detect .NET projects
+            if find . -maxdepth 2 -name "*.csproj" -o -name "*.fsproj" -o -name "*.vbproj" -o -name "packages.config" -o -name "project.json" | grep -q .; then
+              NEEDS_DOTNET=true
+              echo "✓ Detected: .NET project"
+              
+              # Detect .NET version
+              DOTNET_VERSION=""
+              if find . -maxdepth 2 -name "*.csproj" | head -1 | xargs grep -i "TargetFramework" 2>/dev/null | grep -oP '\d+\.\d+' | head -1; then
+                DOTNET_VERSION=$(find . -maxdepth 2 -name "*.csproj" | head -1 | xargs grep -i "TargetFramework" 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+                echo "  .NET version: $DOTNET_VERSION"
+              fi
+              
+              # Install .NET SDK if needed
+              if ! command -v dotnet &> /dev/null; then
+                echo "  Installing .NET SDK..."
+                wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+                chmod +x dotnet-install.sh
+                ./dotnet-install.sh --channel LTS || echo "  Warning: Could not install .NET SDK"
+                export PATH="$HOME/.dotnet:$PATH"
+              fi
+            fi
+            
+            # Detect Go projects
+            if [ -f go.mod ] || [ -f go.sum ] || [ -f Gopkg.toml ]; then
+              NEEDS_GO=true
+              echo "✓ Detected: Go project"
+              
+              # Detect Go version
+              GO_VERSION=""
+              if [ -f go.mod ]; then
+                GO_VERSION=$(grep -i "^go " go.mod | grep -oP '\d+\.\d+' | head -1)
+                if [ -n "$GO_VERSION" ]; then
+                  echo "  Go version from go.mod: $GO_VERSION"
+                fi
+              fi
+              
+              # Install Go if needed
+              if [ -n "$GO_VERSION" ]; then
+                echo "  Installing Go $GO_VERSION..."
+                wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O go.tar.gz || echo "  Warning: Could not download Go $GO_VERSION"
+                if [ -f go.tar.gz ]; then
+                  sudo rm -rf /usr/local/go
+                  sudo tar -C /usr/local -xzf go.tar.gz
+                  export PATH="/usr/local/go/bin:$PATH"
+                fi
+              elif ! command -v go &> /dev/null; then
+                echo "  Installing latest Go..."
+                wget -q "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz" -O go.tar.gz || true
+                if [ -f go.tar.gz ]; then
+                  sudo rm -rf /usr/local/go
+                  sudo tar -C /usr/local -xzf go.tar.gz
+                  export PATH="/usr/local/go/bin:$PATH"
+                fi
+              fi
+            fi
+            
+            # Detect PHP projects
+            if [ -f composer.json ] || [ -f composer.lock ]; then
+              NEEDS_PHP=true
+              echo "✓ Detected: PHP project"
+              
+              # Detect PHP version
+              PHP_VERSION=""
+              if [ -f composer.json ]; then
+                PHP_VERSION=$(grep -i '"php"' composer.json | grep -oP '\d+\.\d+' | head -1)
+                if [ -n "$PHP_VERSION" ]; then
+                  echo "  PHP version from composer.json: $PHP_VERSION"
+                fi
+              fi
+              
+              # Install PHP and Composer if needed
+              if ! command -v php &> /dev/null; then
+                echo "  Installing PHP..."
+                sudo apt-get update -qq || true
+                sudo apt-get install -y php php-cli php-xml php-mbstring php-curl || echo "  Warning: Could not install PHP"
+              fi
+              
+              if ! command -v composer &> /dev/null; then
+                echo "  Installing Composer..."
+                curl -sS https://getcomposer.org/installer | php
+                sudo mv composer.phar /usr/local/bin/composer || true
+              fi
+            fi
+            
+            # Detect Ruby projects
+            if [ -f Gemfile ] || [ -f Gemfile.lock ]; then
+              NEEDS_RUBY=true
+              echo "✓ Detected: Ruby project"
+              
+              # Detect Ruby version
+              RUBY_VERSION=""
+              if [ -f .ruby-version ]; then
+                RUBY_VERSION=$(cat .ruby-version | xargs)
+                echo "  Ruby version from .ruby-version: $RUBY_VERSION"
+              elif [ -f Gemfile ]; then
+                RUBY_VERSION=$(grep -i "ruby" Gemfile | grep -oP '\d+\.\d+' | head -1)
+                if [ -n "$RUBY_VERSION" ]; then
+                  echo "  Ruby version from Gemfile: $RUBY_VERSION"
+                fi
+              fi
+              
+              # Install Ruby if needed
+              if ! command -v ruby &> /dev/null || [ -n "$RUBY_VERSION" ]; then
+                echo "  Installing Ruby..."
+                if ! command -v rbenv &> /dev/null; then
+                  git clone https://github.com/rbenv/rbenv.git ~/.rbenv
+                  export PATH="$HOME/.rbenv/bin:$PATH"
+                  eval "$(rbenv init -)"
+                fi
+                if [ -n "$RUBY_VERSION" ]; then
+                  rbenv install -s "$RUBY_VERSION" || echo "  Warning: Could not install Ruby $RUBY_VERSION"
+                  rbenv global "$RUBY_VERSION"
+                fi
+              fi
+              
+              # Install Bundler if needed
+              if ! command -v bundle &> /dev/null; then
+                gem install bundler || true
+              fi
+            fi
+            
+            # Detect Rust projects
+            if [ -f Cargo.toml ] || [ -f Cargo.lock ]; then
+              NEEDS_RUST=true
+              echo "✓ Detected: Rust project"
+              
+              # Install Rust if needed
+              if ! command -v rustc &> /dev/null; then
+                echo "  Installing Rust..."
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                source "$HOME/.cargo/env"
+              fi
+            fi
+            
+            # Detect Swift projects
+            if [ -f Package.swift ] || [ -f Podfile ] || [ -f Podfile.lock ]; then
+              NEEDS_SWIFT=true
+              echo "✓ Detected: Swift/Objective-C project"
+              echo "  Note: Swift requires macOS runners, skipping installation on Linux"
+            fi
+            
+            # Install project dependencies based on detected languages
+            echo ""
+            echo "Installing project dependencies for $branch..."
+            
+            if [ "$NEEDS_NODE" = true ]; then
+              if [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile || yarn install || true
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile || pnpm install || true
+              elif [ -f package-lock.json ]; then
+                npm ci || npm install || true
+              elif [ -f package.json ]; then
+                npm install || true
+              fi
+            fi
+            
+            if [ "$NEEDS_JAVA" = true ]; then
+              if [ -f gradlew ]; then
+                ./gradlew dependencies --no-daemon || true
+              elif [ -f pom.xml ]; then
+                if ! command -v mvn &> /dev/null; then
+                  echo "  Installing Maven..."
+                  wget https://archive.apache.org/dist/maven/maven-3/3.9.5/binaries/apache-maven-3.9.5-bin.tar.gz
+                  tar -xzf apache-maven-3.9.5-bin.tar.gz
+                  export PATH="$PWD/apache-maven-3.9.5/bin:$PATH"
+                fi
+                mvn dependency:resolve || true
+              elif [ -f build.sbt ]; then
+                if ! command -v sbt &> /dev/null; then
+                  echo "  Installing sbt..."
+                  curl -s "https://raw.githubusercontent.com/sbt/sbt/1.x/sbt" > sbt
+                  chmod +x sbt
+                  export PATH="$PWD:$PATH"
+                fi
+                sbt update || true
+              fi
+            fi
+            
+            if [ "$NEEDS_PYTHON" = true ]; then
+              if [ -f Pipfile ]; then
+                pipenv install --dev || pipenv install || true
+              elif [ -f poetry.lock ] || [ -f pyproject.toml ]; then
+                poetry install || true
+              elif [ -f requirements.txt ]; then
+                pip install -r requirements.txt || true
+              elif [ -f setup.py ]; then
+                pip install -e . || true
+              fi
+            fi
+            
+            if [ "$NEEDS_DOTNET" = true ]; then
+              dotnet restore || true
+            fi
+            
+            if [ "$NEEDS_GO" = true ]; then
+              go mod download || true
+            fi
+            
+            if [ "$NEEDS_PHP" = true ]; then
+              composer install --no-interaction || true
+            fi
+            
+            if [ "$NEEDS_RUBY" = true ]; then
+              bundle install || true
+            fi
+            
+            if [ "$NEEDS_RUST" = true ]; then
+              cargo fetch || true
+            fi
+            
+            echo "Dependency detection and installation completed for $branch"
+            echo ""
+            
+            # Set project name with repo and branch
+            PROJECT_NAME="$REPO_NAME - $branch"
+            
+            # Snyk Open Source dependency scan (SCA) and monitor
+            echo "Running Snyk monitor (SCA) for $branch..."
+            snyk monitor \
+              --all-projects \
+              --target-reference="$branch" \
+              --project-tags="repo=$REPO_NAME,branch=$branch" \
+              --severity-threshold=medium || true
+            
+            # Snyk Code (SAST) scan + Upload report to Snyk UI
+            echo "Running Snyk Code test for $branch..."
+            snyk code test \
+              --severity-threshold=medium \
+              --report \
+              --project-name="$PROJECT_NAME SAST" || true
+            
+            # Container scanning - Dockerfile analysis
+            echo "Scanning Dockerfiles for $branch..."
+            dockerfile_list=$(find . -name "Dockerfile*" -type f ! -path "*/node_modules/*" ! -path "*/.git/*")
+            dockerfile_count=$(echo "$dockerfile_list" | grep -c . || echo "0")
+            
+            if [ "$dockerfile_count" -eq 0 ]; then
+              echo "No Dockerfiles found in this branch."
+            else
+              echo "Found $dockerfile_count Dockerfile(s). Starting scans..."
+              echo ""
+              
+              echo "$dockerfile_list" | while read -r dockerfile; do
+                echo "========================================="
+                echo "Scanning Dockerfile: $dockerfile"
+                echo "========================================="
+                
+                # Get directory containing Dockerfile
+                dockerfile_dir=$(dirname "$dockerfile")
+                dockerfile_name=$(basename "$dockerfile")
+                
+                # Generate a valid image name (handle root directory case)
+                if [ "$dockerfile_dir" = "." ]; then
+                  image_name="snyk-test-root"
+                else
+                  image_name="snyk-test-$(echo "$dockerfile_dir" | tr '/' '-' | tr ' ' '-' | sed 's/^\.-//')"
+                fi
+                image_name=$(echo "$image_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+                
+                # Ensure image name is not empty
+                if [ -z "$image_name" ]; then
+                  image_name="snyk-test-image"
+                fi
+                
+                echo "Step 1: Attempting to build image: $image_name:latest from $dockerfile..."
+                build_success=false
+                if docker build -t "$image_name:latest" -f "$dockerfile" "$dockerfile_dir" 2>&1; then
+                  echo "Successfully built image: $image_name:latest"
+                  build_success=true
+                  
+                  # Scan the built container image
+                  echo "Step 2: Running Snyk container test on built image..."
+                  snyk container test "$image_name:latest" \
+                    --file="$dockerfile" \
+                    --severity-threshold=low \
+                    --report \
+                    --project-name="$PROJECT_NAME Container Image - $dockerfile" || {
+                    echo "Warning: Snyk container test on built image failed."
+                  }
+                  
+                  # Monitor the container image
+                  echo "Step 3: Running Snyk container monitor on built image..."
+                  snyk container monitor "$image_name:latest" \
+                    --file="$dockerfile" \
+                    --project-name="$PROJECT_NAME Container Image - $dockerfile" || {
+                    echo "Warning: Snyk container monitor on built image failed."
+                  }
+                else
+                  echo "Warning: Could not build image from $dockerfile."
+                  echo "Attempting to extract and scan base image from Dockerfile..."
+                  
+                  # Extract base image from Dockerfile
+                  base_image=$(grep -i "^FROM" "$dockerfile" | head -1 | awk '{print $2}' | cut -d'@' -f1 | cut -d':' -f1-2)
+                  
+                  if [ -n "$base_image" ] && [ "$base_image" != "FROM" ]; then
+                    echo "Found base image: $base_image"
+                    
+                    # Try to pull the base image
+                    echo "Step 2: Attempting to pull base image: $base_image..."
+                    if docker pull "$base_image" 2>&1; then
+                      echo "Successfully pulled base image: $base_image"
+                      
+                      # Verify image exists locally
+                      if docker image inspect "$base_image" >/dev/null 2>&1; then
+                        echo "Step 3: Scanning base image for vulnerabilities..."
+                        
+                        # Scan the base image
+                        snyk container test "$base_image" \
+                          --file="$dockerfile" \
+                          --severity-threshold=low \
+                          --report \
+                          --project-name="$PROJECT_NAME Container Base - $dockerfile" || {
+                          echo "Warning: Snyk container test on base image failed."
+                        }
+                        
+                        # Monitor the base image
+                        echo "Step 4: Running Snyk container monitor on base image..."
+                        snyk container monitor "$base_image" \
+                          --file="$dockerfile" \
+                          --project-name="$PROJECT_NAME Container Base - $dockerfile" || {
+                          echo "Warning: Snyk container monitor on base image failed."
+                        }
+                      else
+                        echo "Warning: Base image $base_image could not be verified locally. Skipping scan."
+                      fi
+                    else
+                      echo "Warning: Could not pull base image: $base_image"
+                      echo "The image may not exist, be deprecated, or require authentication."
+                      
+                      # Try alternative image names for common deprecated images
+                      alternative_image=""
+                      if echo "$base_image" | grep -qi "openjdk"; then
+                        # Try eclipse-temurin as alternative to openjdk
+                        tag=$(echo "$base_image" | cut -d':' -f2)
+                        if [ -n "$tag" ]; then
+                          alternative_image="eclipse-temurin:${tag}"
+                        else
+                          alternative_image="eclipse-temurin:17-jdk-alpine"
+                        fi
+                        echo "Attempting alternative image: $alternative_image..."
+                        
+                        if docker pull "$alternative_image" 2>&1; then
+                          echo "Successfully pulled alternative image: $alternative_image"
+                          if docker image inspect "$alternative_image" >/dev/null 2>&1; then
+                            echo "Scanning alternative base image for vulnerabilities..."
+                            snyk container test "$alternative_image" \
+                              --file="$dockerfile" \
+                              --severity-threshold=low \
+                              --report \
+                              --project-name="$PROJECT_NAME Container Base (Alt) - $dockerfile" || {
+                              echo "Warning: Snyk container test on alternative base image failed."
+                            }
+                            
+                            snyk container monitor "$alternative_image" \
+                              --file="$dockerfile" \
+                              --project-name="$PROJECT_NAME Container Base (Alt) - $dockerfile" || {
+                              echo "Warning: Snyk container monitor on alternative base image failed."
+                            }
+                          fi
+                        else
+                          echo "Alternative image also failed. Cannot scan base image."
+                        fi
+                      else
+                        echo "No alternative image mapping available. Cannot scan base image."
+                      fi
+                    fi
+                  else
+                    echo "Could not extract base image from Dockerfile. Skipping base image scan."
+                  fi
+                fi
+                
+                echo "Completed scanning Dockerfile: $dockerfile"
+                echo ""
+              done
+              
+              echo "Completed scanning all $dockerfile_count Dockerfile(s)."
+            fi
+            echo ""
+            
+            # Container scanning - docker-compose.yml services
+            echo "Scanning docker-compose services for $branch..."
+            find . \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" \) -type f ! -path "*/node_modules/*" ! -path "*/.git/*" | while read -r compose_file; do
+              echo "Found docker-compose file: $compose_file"
+              
+              # Extract service names and build contexts from docker-compose
+              if command -v docker-compose &> /dev/null || docker compose version &> /dev/null; then
+                # Try to get services that have build contexts
+                services=$(docker compose -f "$compose_file" config --services 2>/dev/null || docker-compose -f "$compose_file" config --services 2>/dev/null || echo "")
+                
+                if [ -n "$services" ]; then
+                  echo "$services" | while read -r service; do
+                    echo "Processing service: $service from $compose_file"
+                    
+                    # Build the service
+                    service_image="snyk-test-$(echo "$service" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')"
+                    if docker compose -f "$compose_file" build "$service" 2>/dev/null || docker-compose -f "$compose_file" build "$service" 2>/dev/null; then
+                      # Get the image name from docker-compose
+                      image_tag=$(docker compose -f "$compose_file" config 2>/dev/null | grep -A 5 "services:" | grep -A 5 "$service:" | grep "image:" | head -1 | awk '{print $2}' | tr -d '"' || echo "${service_image}:latest")
+                      
+                      # Find associated Dockerfile if exists
+                      build_context=$(docker compose -f "$compose_file" config 2>/dev/null | grep -A 10 "services:" | grep -A 10 "$service:" | grep -A 5 "build:" | grep "context:" | head -1 | awk '{print $2}' | tr -d '"' || echo ".")
+                      dockerfile_path=$(docker compose -f "$compose_file" config 2>/dev/null | grep -A 10 "services:" | grep -A 10 "$service:" | grep -A 5 "build:" | grep "dockerfile:" | head -1 | awk '{print $2}' | tr -d '"' || echo "")
+                      
+                      if [ -n "$dockerfile_path" ] && [ -f "$dockerfile_path" ]; then
+                        dockerfile_arg="--file=$dockerfile_path"
+                      elif [ -f "$build_context/Dockerfile" ]; then
+                        dockerfile_arg="--file=$build_context/Dockerfile"
+                      else
+                        dockerfile_arg=""
+                      fi
+                      
+                      # Scan the service image
+                      echo "Running Snyk container test for service $service ($image_tag)..."
+                      if [ -n "$dockerfile_arg" ]; then
+                        snyk container test "$image_tag" $dockerfile_arg \
+                          --severity-threshold=medium \
+                          --report \
+                          --project-name="$PROJECT_NAME Container - $service" || true
+                        
+                        snyk container monitor "$image_tag" $dockerfile_arg \
+                          --project-name="$PROJECT_NAME Container - $service" || true
+                      else
+                        snyk container test "$image_tag" \
+                          --severity-threshold=medium \
+                          --report \
+                          --project-name="$PROJECT_NAME Container - $service" || true
+                        
+                        snyk container monitor "$image_tag" \
+                          --project-name="$PROJECT_NAME Container - $service" || true
+                      fi
+                    fi
+                  done
+                fi
+              fi
+            done
+            
+            # Container scanning - OCI/Docker archives (.tar files)
+            echo "Scanning container archives for $branch..."
+            find . -name "*.tar" -type f ! -path "*/node_modules/*" ! -path "*/.git/*" | while read -r archive; do
+              echo "Found container archive: $archive"
+              
+              # Determine archive type (docker-archive or oci-archive)
+              if tar -tf "$archive" | grep -q "manifest.json" && tar -tf "$archive" | grep -q "repositories"; then
+                archive_type="docker-archive"
+              else
+                archive_type="oci-archive"
+              fi
+              
+              echo "Running Snyk container test for $archive_type:$archive..."
+              snyk container test "$archive_type:$archive" \
+                --severity-threshold=medium \
+                --report \
+                --project-name="$PROJECT_NAME Container Archive - $(basename $archive)" || true
+              
+              snyk container monitor "$archive_type:$archive" \
+                --project-name="$PROJECT_NAME Container Archive - $(basename $archive)" || true
+            done
+            
+            echo "Completed scanning branch: $branch"
+            echo ""
+          done
