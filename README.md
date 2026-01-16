@@ -1,4 +1,4 @@
-# VeraDemo - Blab-a-Gag
+# VeraDemo - Blab-a-Gag - --edit made for CLI testing --
 
 ### :information_source: Notice
 
