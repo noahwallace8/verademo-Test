@@ -507,8 +507,6 @@ jobs:
             # Snyk Code (SAST) scan + Upload report to Snyk UI
             echo "Running Snyk Code test for $branch..."
             snyk code test \
-              --target-reference="$branch" \
-              --project-tags="repo=$REPO_NAME,branch=$branch" \
               --severity-threshold=medium \
               --report \
               --project-name="$PROJECT_NAME SAST" || true
@@ -535,7 +533,7 @@ jobs:
                 
                 # Generate a valid image name (handle root directory case)
                 if [ "$dockerfile_dir" = "." ]; then
-                  image_name="$PROJECT_NAME/snyk-container-scan"
+                  image_name="snyk-container-scan"
                 else
                   image_name="snyk-test-$(echo "$dockerfile_dir" | tr '/' '-' | tr ' ' '-' | sed 's/^\.-//')"
                 fi
