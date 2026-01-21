@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   snyk-security-scan:
@@ -29,6 +30,18 @@ jobs:
         id: install-snyk-cli
         run: |
           npm install -g snyk
+
+      # Install GitHub CLI and jq
+      - name: Install GitHub CLI and jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          type -p curl >/dev/null || sudo apt install curl -y
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt-get update \
+          && sudo apt-get install gh -y
 
       # Set up Docker Buildx (for building container images)
       - name: Set up Docker Buildx
@@ -489,8 +502,101 @@ jobs:
             # Set project name with repo and branch
             PROJECT_NAME="$REPO_NAME - $branch"
             
+            # Function to create GitHub issues from Snyk JSON results
+            create_issues_from_snyk_json() {
+              local json_file="$1"
+              local scan_type="$2"
+              local scan_target="$3"
+              
+              if [ ! -f "$json_file" ] || [ ! -s "$json_file" ]; then
+                echo "No JSON results file found or file is empty: $json_file"
+                return 0
+              fi
+              
+              # Check if there are vulnerabilities
+              local vuln_count=$(jq -r '.vulnerabilities | length' "$json_file" 2>/dev/null || echo "0")
+              local issues_count=$(jq -r '.runs[0].results | length' "$json_file" 2>/dev/null || echo "0")
+              
+              # Handle different JSON structures for different scan types
+              if [ "$scan_type" = "code" ]; then
+                # Snyk Code (SAST) structure
+                if [ "$issues_count" = "0" ] || [ "$issues_count" = "null" ]; then
+                  echo "No SAST issues found in $scan_target"
+                  return 0
+                fi
+                
+                echo "Found $issues_count SAST issues. Creating GitHub issues..."
+                jq -r '.runs[0].results[] | @json' "$json_file" 2>/dev/null | while IFS= read -r issue_json; do
+                  if [ -n "$issue_json" ] && [ "$issue_json" != "null" ]; then
+                    rule_id=$(echo "$issue_json" | jq -r '.ruleId // .rule.id // "unknown"' 2>/dev/null)
+                    message=$(echo "$issue_json" | jq -r '.message.text // .message // "Security issue found"' 2>/dev/null | head -c 200)
+                    severity=$(echo "$issue_json" | jq -r '.level // "medium"' 2>/dev/null)
+                    locations=$(echo "$issue_json" | jq -r '.locations[0].physicalLocation.artifactLocation.uri // "unknown"' 2>/dev/null)
+                    
+                    issue_title="[SAST] $rule_id - $scan_target"
+                    issue_body="## Snyk Code (SAST) Finding
+**Scan Type:** SAST
+**Target:** $scan_target
+**Branch:** $branch
+**Rule ID:** $rule_id
+**Severity:** $severity
+**Location:** $locations
+**Message:** $message
+
+---
+*This issue was automatically created by Snyk Security Scan workflow*"
+                    
+                    gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,sast" || echo "Failed to create issue for $rule_id"
+                  fi
+                done
+              else
+                # SCA or Container scan structure
+                if [ "$vuln_count" = "0" ] || [ "$vuln_count" = "null" ]; then
+                  echo "No vulnerabilities found in $scan_target"
+                  return 0
+                fi
+                
+                echo "Found $vuln_count vulnerabilities. Creating GitHub issues..."
+                jq -r '.vulnerabilities[] | @json' "$json_file" 2>/dev/null | while IFS= read -r vuln_json; do
+                  if [ -n "$vuln_json" ] && [ "$vuln_json" != "null" ]; then
+                    vuln_id=$(echo "$vuln_json" | jq -r '.id // .vulnerabilityId // "unknown"' 2>/dev/null)
+                    title=$(echo "$vuln_json" | jq -r '.title // .name // "Vulnerability"' 2>/dev/null | head -c 200)
+                    severity=$(echo "$vuln_json" | jq -r '.severity // "medium"' 2>/dev/null)
+                    package=$(echo "$vuln_json" | jq -r '.packageName // .from[0] // "unknown"' 2>/dev/null)
+                    version=$(echo "$vuln_json" | jq -r '.version // .from[1] // "unknown"' 2>/dev/null)
+                    description=$(echo "$vuln_json" | jq -r '.description // .summary // "No description available"' 2>/dev/null | head -c 1000)
+                    
+                    issue_title="[$scan_type] $vuln_id - $package@$version"
+                    issue_body="## Snyk $scan_type Finding
+**Scan Type:** $scan_type
+**Target:** $scan_target
+**Branch:** $branch
+**Vulnerability ID:** $vuln_id
+**Package:** $package
+**Version:** $version
+**Severity:** $severity
+**Description:** $description
+
+---
+*This issue was automatically created by Snyk Security Scan workflow*"
+                    
+                    gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,$scan_type" || echo "Failed to create issue for $vuln_id"
+                  fi
+                done
+              fi
+            }
+            
             # Snyk Open Source dependency scan (SCA) and monitor
-            echo "Running Snyk monitor (SCA) for $branch..."
+            echo "Running Snyk test (SCA) for $branch..."
+            snyk_json_file="/tmp/snyk-sca-$branch.json"
+            snyk test \
+              --all-projects \
+              --json > "$snyk_json_file" 2>&1 || true
+            
+            # Create issues from SCA results
+            create_issues_from_snyk_json "$snyk_json_file" "sca" "Open Source Dependencies"
+            
+            # Still run monitor for Snyk UI
             snyk monitor \
               --all-projects \
               --target-reference="$branch" \
@@ -499,6 +605,14 @@ jobs:
             
             # Snyk Code (SAST) scan + Upload report to Snyk UI
             echo "Running Snyk Code test for $branch..."
+            snyk_code_json_file="/tmp/snyk-code-$branch.json"
+            snyk code test \
+              --json > "$snyk_code_json_file" 2>&1 || true
+            
+            # Create issues from SAST results
+            create_issues_from_snyk_json "$snyk_code_json_file" "code" "Source Code"
+            
+            # Still upload report to Snyk UI
             snyk code test \
               --severity-threshold=medium \
               --report \
@@ -545,6 +659,15 @@ jobs:
                   
                   # Scan the built container image
                   echo "Step 2: Running Snyk container test on built image..."
+                  container_json_file="/tmp/snyk-container-$image_name-$dockerfile_name.json"
+                  snyk container test "$image_name:latest" \
+                    --file="$dockerfile" \
+                    --json > "$container_json_file" 2>&1 || true
+                  
+                  # Create issues from container scan results
+                  create_issues_from_snyk_json "$container_json_file" "container" "$image_name:latest ($dockerfile)"
+                  
+                  # Still run with report for Snyk UI
                   snyk container test "$image_name:latest" \
                     --file="$dockerfile" \
                     --target-reference="$branch" \
@@ -584,6 +707,15 @@ jobs:
                         echo "Step 3: Scanning base image for vulnerabilities..."
                         
                         # Scan the base image
+                        base_container_json_file="/tmp/snyk-container-base-$base_image-$dockerfile_name.json"
+                        snyk container test "$base_image" \
+                          --file="$dockerfile" \
+                          --json > "$base_container_json_file" 2>&1 || true
+                        
+                        # Create issues from base image scan results
+                        create_issues_from_snyk_json "$base_container_json_file" "container" "$base_image (base for $dockerfile)"
+                        
+                        # Still run with report for Snyk UI
                         snyk container test "$base_image" \
                           --file="$dockerfile" \
                           --target-reference="$branch" \
@@ -626,6 +758,15 @@ jobs:
                           echo "Successfully pulled alternative image: $alternative_image"
                           if docker image inspect "$alternative_image" >/dev/null 2>&1; then
                             echo "Scanning alternative base image for vulnerabilities..."
+                            alt_container_json_file="/tmp/snyk-container-alt-$alternative_image-$dockerfile_name.json"
+                            snyk container test "$alternative_image" \
+                              --file="$dockerfile" \
+                              --json > "$alt_container_json_file" 2>&1 || true
+                            
+                            # Create issues from alternative base image scan results
+                            create_issues_from_snyk_json "$alt_container_json_file" "container" "$alternative_image (alt base for $dockerfile)"
+                            
+                            # Still run with report for Snyk UI
                             snyk container test "$alternative_image" \
                               --file="$dockerfile" \
                               --target-reference="$branch" \
@@ -698,7 +839,15 @@ jobs:
                       
                       # Scan the service image
                       echo "Running Snyk container test for service $service ($image_tag)..."
+                      compose_container_json_file="/tmp/snyk-container-compose-$service.json"
                       if [ -n "$dockerfile_arg" ]; then
+                        snyk container test "$image_tag" $dockerfile_arg \
+                          --json > "$compose_container_json_file" 2>&1 || true
+                        
+                        # Create issues from docker-compose service scan results
+                        create_issues_from_snyk_json "$compose_container_json_file" "container" "$service ($image_tag)"
+                        
+                        # Still run with report for Snyk UI
                         snyk container test "$image_tag" $dockerfile_arg \
                           --target-reference="$branch" \
                           --project-tags="repo=$REPO_NAME,branch=$branch" \
@@ -711,6 +860,13 @@ jobs:
                           --project-tags="repo=$REPO_NAME,branch=$branch" \
                           --project-name="$PROJECT_NAME Container - $service" || true
                       else
+                        snyk container test "$image_tag" \
+                          --json > "$compose_container_json_file" 2>&1 || true
+                        
+                        # Create issues from docker-compose service scan results
+                        create_issues_from_snyk_json "$compose_container_json_file" "container" "$service ($image_tag)"
+                        
+                        # Still run with report for Snyk UI
                         snyk container test "$image_tag" \
                           --target-reference="$branch" \
                           --project-tags="repo=$REPO_NAME,branch=$branch" \
@@ -742,6 +898,14 @@ jobs:
               fi
               
               echo "Running Snyk container test for $archive_type:$archive..."
+              archive_json_file="/tmp/snyk-container-archive-$(basename $archive).json"
+              snyk container test "$archive_type:$archive" \
+                --json > "$archive_json_file" 2>&1 || true
+              
+              # Create issues from archive scan results
+              create_issues_from_snyk_json "$archive_json_file" "container" "$archive_type:$archive"
+              
+              # Still run with report for Snyk UI
               snyk container test "$archive_type:$archive" \
                 --target-reference="$branch" \
                 --project-tags="repo=$REPO_NAME,branch=$branch" \
