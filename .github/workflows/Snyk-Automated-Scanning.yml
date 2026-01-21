@@ -52,10 +52,7 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           REPO_NAME: ${{ github.repository }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Authenticate GitHub CLI
-          echo "$GITHUB_TOKEN" | gh auth login --with-token
           # Fetch all remote branches
           git fetch --all
           
