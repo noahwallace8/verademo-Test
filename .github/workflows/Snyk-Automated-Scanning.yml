@@ -400,17 +400,10 @@ jobs:
               fi
             fi
             
-            # Detect Rust projects
+            # Detect Rust projects (Rust is not auto-installed; use a runner with Rust pre-installed for Rust/Cargo scanning)
             if [ -f Cargo.toml ] || [ -f Cargo.lock ]; then
               NEEDS_RUST=true
               echo "✓ Detected: Rust project"
-              
-              # Install Rust if needed
-              if ! command -v rustc &> /dev/null; then
-                echo "  Installing Rust..."
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-                source "$HOME/.cargo/env"
-              fi
             fi
             
             # Detect Swift projects
