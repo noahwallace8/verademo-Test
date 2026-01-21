@@ -52,7 +52,10 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           REPO_NAME: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Authenticate GitHub CLI
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
           # Fetch all remote branches
           git fetch --all
           
@@ -534,17 +537,7 @@ jobs:
                     locations=$(echo "$issue_json" | jq -r '.locations[0].physicalLocation.artifactLocation.uri // "unknown"' 2>/dev/null)
                     
                     issue_title="[SAST] $rule_id - $scan_target"
-                    issue_body="## Snyk Code (SAST) Finding
-**Scan Type:** SAST
-**Target:** $scan_target
-**Branch:** $branch
-**Rule ID:** $rule_id
-**Severity:** $severity
-**Location:** $locations
-**Message:** $message
-
----
-*This issue was automatically created by Snyk Security Scan workflow*"
+                    issue_body="## Snyk Code (SAST) Finding"$'\n'"**Scan Type:** SAST"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Rule ID:** ${rule_id}"$'\n'"**Severity:** ${severity}"$'\n'"**Location:** ${locations}"$'\n'"**Message:** ${message}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
                     
                     gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,sast" || echo "Failed to create issue for $rule_id"
                   fi
@@ -566,21 +559,10 @@ jobs:
                     version=$(echo "$vuln_json" | jq -r '.version // .from[1] // "unknown"' 2>/dev/null)
                     description=$(echo "$vuln_json" | jq -r '.description // .summary // "No description available"' 2>/dev/null | head -c 1000)
                     
-                    issue_title="[$scan_type] $vuln_id - $package@$version"
-                    issue_body="## Snyk $scan_type Finding
-**Scan Type:** $scan_type
-**Target:** $scan_target
-**Branch:** $branch
-**Vulnerability ID:** $vuln_id
-**Package:** $package
-**Version:** $version
-**Severity:** $severity
-**Description:** $description
-
----
-*This issue was automatically created by Snyk Security Scan workflow*"
+                    issue_title="[${scan_type}] ${vuln_id} - ${package}@${version}"
+                    issue_body="## Snyk ${scan_type} Finding"$'\n'"**Scan Type:** ${scan_type}"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Vulnerability ID:** ${vuln_id}"$'\n'"**Package:** ${package}"$'\n'"**Version:** ${version}"$'\n'"**Severity:** ${severity}"$'\n'"**Description:** ${description}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
                     
-                    gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,$scan_type" || echo "Failed to create issue for $vuln_id"
+                    gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,${scan_type}" || echo "Failed to create issue for $vuln_id"
                   fi
                 done
               fi
