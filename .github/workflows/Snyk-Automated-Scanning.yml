@@ -71,6 +71,107 @@ jobs:
           echo "Verifying GitHub CLI can create issues..."
           gh auth status
           
+          # Create Python helper script for consolidated issue management
+          cat > /tmp/consolidate_issues.py << 'PYTHONSCRIPT'
+          import json, subprocess, sys
+          
+          def run_gh(args):
+              try:
+                  r = subprocess.run(['gh'] + args, capture_output=True, text=True, check=False)
+                  return r.returncode, r.stdout, r.stderr
+              except Exception as e:
+                  return 1, "", str(e)
+          
+          def find_existing_issue(vuln_id):
+              rc, out, err = run_gh(['issue', 'list', '--label', 'snyk', '--state', 'open', '--search', f'{vuln_id} in:title', '--json', 'number,title,body', '--limit', '1'])
+              if rc == 0:
+                  try:
+                      issues = json.loads(out)
+                      return issues[0] if issues else None
+                  except: 
+                      pass
+              return None
+          
+          def add_branch_comment(issue_num, branch, location, pkg=""):
+              comment = f"**New occurrence detected:**\nBranch: `{branch}`\n"
+              if location: 
+                  comment += f"Location: {location}\n"
+              if pkg: 
+                  comment += f"Package: {pkg}\n"
+              rc, _, err = run_gh(['issue', 'comment', str(issue_num), '--body', comment])
+              if rc == 0:
+                  print(f"✓ Updated issue #{issue_num} with branch: {branch}")
+                  return True
+              print(f"✗ Failed to update issue #{issue_num}: {err}", file=sys.stderr)
+              return False
+          
+          def create_issue(title, body, labels):
+              args = ['issue', 'create', '--title', title, '--body', body]
+              if labels: 
+                  args.extend(['--label', ','.join(labels)])
+              rc, _, err = run_gh(args)
+              if rc == 0:
+                  print(f"✓ Created new issue: {title}")
+                  return True
+              print(f"✗ Failed to create issue: {err}", file=sys.stderr)
+              return False
+          
+          def process_sast(finding, branch):
+              rule_id = finding.get('ruleId') or finding.get('rule', {}).get('id', 'unknown')
+              msg = finding.get('message', {}).get('text', 'Security issue')[:200]
+              sev = finding.get('level', 'medium').upper()
+              loc = finding.get('locations', [{}])[0].get('physicalLocation', {}).get('artifactLocation', {}).get('uri', 'unknown')
+              title = f"[SAST] {rule_id}"
+              existing = find_existing_issue(rule_id)
+              if existing:
+                  num = existing['number']
+                  if f"`{branch}`" in existing.get('body', ''):
+                      print(f"  Branch {branch} already in issue #{num}")
+                  else:
+                      add_branch_comment(num, branch, loc)
+              else:
+                  body = f"## Snyk Code (SAST) Finding\n\n**Rule ID:** {rule_id}\n**Severity:** {sev}\n**Message:** {msg}\n\n### Affected Branches\n- `{branch}` ({loc})\n\n---\n*Auto-created by Snyk Security Scan*"
+                  create_issue(title, body, ['security', 'snyk', 'sast'])
+          
+          def process_sca(vuln, branch, scan_type):
+              vid = vuln.get('id') or vuln.get('vulnerabilityId', 'unknown')
+              pkg = vuln.get('packageName') or (vuln.get('from', ['unknown'])[0] if vuln.get('from') else 'unknown')
+              ver = vuln.get('version') or (vuln.get('from', [None, 'unknown'])[1] if vuln.get('from') and len(vuln.get('from', [])) > 1 else 'unknown')
+              sev = vuln.get('severity', 'medium').upper()
+              desc = (vuln.get('description') or vuln.get('summary', 'No description'))[:1000]
+              title = f"[{scan_type}] {vid} - {pkg}"
+              existing = find_existing_issue(vid)
+              if existing:
+                  num = existing['number']
+                  if f"`{branch}`" in existing.get('body', ''):
+                      print(f"  Branch {branch} already in issue #{num}")
+                  else:
+                      add_branch_comment(num, branch, "", f"{pkg}@{ver}")
+              else:
+                  body = f"## Snyk {scan_type} Finding\n\n**Vulnerability ID:** {vid}\n**Package:** {pkg}\n**Version:** {ver}\n**Severity:** {sev}\n**Description:** {desc}\n\n### Affected Branches\n- `{branch}`\n\n---\n*Auto-created by Snyk Security Scan*"
+                  create_issue(title, body, ['security', 'snyk', scan_type.lower()])
+          
+          json_file, scan_type, branch = sys.argv[1:4]
+          with open(json_file) as f: 
+              data = json.load(f)
+          results = data if isinstance(data, list) else [data]
+          count = 0
+          if scan_type.lower() == 'code':
+              for r in results:
+                  for run in r.get('runs', []):
+                      for f in run.get('results', []):
+                          process_sast(f, branch)
+                          count += 1
+          else:
+              for r in results:
+                  for v in r.get('vulnerabilities', []):
+                      process_sca(v, branch, scan_type)
+                      count += 1
+          print(f"Processed {count} findings for branch {branch}")
+          PYTHONSCRIPT
+          
+          chmod +x /tmp/consolidate_issues.py
+          
           # Fetch all remote branches
           git fetch --all
           
@@ -519,142 +620,6 @@ jobs:
             PROJECT_NAME="$REPO_NAME - $branch"
             
             # Function to create GitHub issues from Snyk JSON results
-            create_issues_from_snyk_json() {
-              local json_file="$1"
-              local scan_type="$2"
-              local scan_target="$3"
-              
-              if [ ! -f "$json_file" ] || [ ! -s "$json_file" ]; then
-                echo "No JSON results file found or file is empty: $json_file"
-                return 0
-              fi
-              
-              # Validate JSON
-              if ! jq empty "$json_file" 2>/dev/null; then
-                echo "Invalid JSON in $json_file, checking if it contains errors..."
-                head -20 "$json_file" || true
-                return 0
-              fi
-              
-              # Check if JSON is an array (from --all-projects) or single object
-              local is_array=$(jq -r 'if type == "array" then "true" else "false" end' "$json_file" 2>/dev/null || echo "false")
-              
-              # Handle different JSON structures for different scan types
-              if [ "$scan_type" = "code" ]; then
-                # Snyk Code (SAST) structure
-                local issues_count=0
-                if [ "$is_array" = "true" ]; then
-                  issues_count=$(jq '[.[] | .runs[0].results[]?] | length' "$json_file" 2>/dev/null || echo "0")
-                else
-                  issues_count=$(jq '[.runs[0].results[]?] | length' "$json_file" 2>/dev/null || echo "0")
-                fi
-                
-                if [ "$issues_count" = "0" ] || [ "$issues_count" = "null" ]; then
-                  echo "No SAST issues found in $scan_target"
-                  return 0
-                fi
-                
-                echo "Found $issues_count SAST issues. Creating GitHub issues..."
-                if [ "$is_array" = "true" ]; then
-                  jq -c '.[] | .runs[0].results[]?' "$json_file" 2>/dev/null | while IFS= read -r issue_json; do
-                    if [ -n "$issue_json" ] && [ "$issue_json" != "null" ]; then
-                      rule_id=$(echo "$issue_json" | jq -r '.ruleId // .rule.id // "unknown"' 2>/dev/null)
-                      message=$(echo "$issue_json" | jq -r '.message.text // .message // "Security issue found"' 2>/dev/null | head -c 200)
-                      severity=$(echo "$issue_json" | jq -r '.level // "medium"' 2>/dev/null)
-                      locations=$(echo "$issue_json" | jq -r '.locations[0].physicalLocation.artifactLocation.uri // "unknown"' 2>/dev/null)
-                      
-                      issue_title="[SAST] $rule_id - $scan_target"
-                      issue_body="## Snyk Code (SAST) Finding"$'\n'"**Scan Type:** SAST"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Rule ID:** ${rule_id}"$'\n'"**Severity:** ${severity}"$'\n'"**Location:** ${locations}"$'\n'"**Message:** ${message}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
-                      
-                      if gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,sast" 2>&1; then
-                        echo "✓ Created issue for SAST finding: $rule_id"
-                      else
-                        echo "✗ Failed to create issue for $rule_id"
-                      fi
-                    fi
-                  done
-                else
-                  jq -c '.runs[0].results[]?' "$json_file" 2>/dev/null | while IFS= read -r issue_json; do
-                    if [ -n "$issue_json" ] && [ "$issue_json" != "null" ]; then
-                      rule_id=$(echo "$issue_json" | jq -r '.ruleId // .rule.id // "unknown"' 2>/dev/null)
-                      message=$(echo "$issue_json" | jq -r '.message.text // .message // "Security issue found"' 2>/dev/null | head -c 200)
-                      severity=$(echo "$issue_json" | jq -r '.level // "medium"' 2>/dev/null)
-                      locations=$(echo "$issue_json" | jq -r '.locations[0].physicalLocation.artifactLocation.uri // "unknown"' 2>/dev/null)
-                      
-                      issue_title="[SAST] $rule_id - $scan_target"
-                      issue_body="## Snyk Code (SAST) Finding"$'\n'"**Scan Type:** SAST"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Rule ID:** ${rule_id}"$'\n'"**Severity:** ${severity}"$'\n'"**Location:** ${locations}"$'\n'"**Message:** ${message}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
-                      
-                      if gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,sast" 2>&1; then
-                        echo "✓ Created issue for SAST finding: $rule_id"
-                      else
-                        echo "✗ Failed to create issue for $rule_id"
-                      fi
-                    fi
-                  done
-                fi
-              else
-                # SCA or Container scan structure
-                local vuln_count=0
-                if [ "$is_array" = "true" ]; then
-                  # Array format from --all-projects: extract all vulnerabilities from all projects
-                  vuln_count=$(jq '[.[] | .vulnerabilities[]?] | length' "$json_file" 2>/dev/null || echo "0")
-                else
-                  # Single object format
-                  vuln_count=$(jq '[.vulnerabilities[]?] | length' "$json_file" 2>/dev/null || echo "0")
-                fi
-                
-                if [ "$vuln_count" = "0" ] || [ "$vuln_count" = "null" ]; then
-                  echo "No vulnerabilities found in $scan_target"
-                  return 0
-                fi
-                
-                echo "Found $vuln_count vulnerabilities. Creating GitHub issues..."
-                if [ "$is_array" = "true" ]; then
-                  # Extract all vulnerabilities from all projects in the array
-                  jq -c '.[] | .vulnerabilities[]?' "$json_file" 2>/dev/null | while IFS= read -r vuln_json; do
-                    if [ -n "$vuln_json" ] && [ "$vuln_json" != "null" ]; then
-                      vuln_id=$(echo "$vuln_json" | jq -r '.id // .vulnerabilityId // "unknown"' 2>/dev/null)
-                      title=$(echo "$vuln_json" | jq -r '.title // .name // "Vulnerability"' 2>/dev/null | head -c 200)
-                      severity=$(echo "$vuln_json" | jq -r '.severity // "medium"' 2>/dev/null)
-                      package=$(echo "$vuln_json" | jq -r '.packageName // .from[0] // "unknown"' 2>/dev/null)
-                      version=$(echo "$vuln_json" | jq -r '.version // .from[1] // "unknown"' 2>/dev/null)
-                      description=$(echo "$vuln_json" | jq -r '.description // .summary // "No description available"' 2>/dev/null | head -c 1000)
-                      
-                      issue_title="[${scan_type}] ${vuln_id} - ${package}@${version}"
-                      issue_body="## Snyk ${scan_type} Finding"$'\n'"**Scan Type:** ${scan_type}"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Vulnerability ID:** ${vuln_id}"$'\n'"**Package:** ${package}"$'\n'"**Version:** ${version}"$'\n'"**Severity:** ${severity}"$'\n'"**Description:** ${description}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
-                      
-                      if gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,${scan_type}" 2>&1; then
-                        echo "✓ Created issue for ${scan_type} finding: $vuln_id"
-                      else
-                        echo "✗ Failed to create issue for $vuln_id"
-                      fi
-                    fi
-                  done
-                else
-                  # Single object format
-                  jq -c '.vulnerabilities[]?' "$json_file" 2>/dev/null | while IFS= read -r vuln_json; do
-                    if [ -n "$vuln_json" ] && [ "$vuln_json" != "null" ]; then
-                      vuln_id=$(echo "$vuln_json" | jq -r '.id // .vulnerabilityId // "unknown"' 2>/dev/null)
-                      title=$(echo "$vuln_json" | jq -r '.title // .name // "Vulnerability"' 2>/dev/null | head -c 200)
-                      severity=$(echo "$vuln_json" | jq -r '.severity // "medium"' 2>/dev/null)
-                      package=$(echo "$vuln_json" | jq -r '.packageName // .from[0] // "unknown"' 2>/dev/null)
-                      version=$(echo "$vuln_json" | jq -r '.version // .from[1] // "unknown"' 2>/dev/null)
-                      description=$(echo "$vuln_json" | jq -r '.description // .summary // "No description available"' 2>/dev/null | head -c 1000)
-                      
-                      issue_title="[${scan_type}] ${vuln_id} - ${package}@${version}"
-                      issue_body="## Snyk ${scan_type} Finding"$'\n'"**Scan Type:** ${scan_type}"$'\n'"**Target:** ${scan_target}"$'\n'"**Branch:** ${branch}"$'\n'"**Vulnerability ID:** ${vuln_id}"$'\n'"**Package:** ${package}"$'\n'"**Version:** ${version}"$'\n'"**Severity:** ${severity}"$'\n'"**Description:** ${description}"$'\n'$'\n'"---"$'\n'"*This issue was automatically created by Snyk Security Scan workflow*"
-                      
-                      if gh issue create --title "$issue_title" --body "$issue_body" --label "security,snyk,${scan_type}" 2>&1; then
-                        echo "✓ Created issue for ${scan_type} finding: $vuln_id"
-                      else
-                        echo "✗ Failed to create issue for $vuln_id"
-                      fi
-                    fi
-                  done
-                fi
-              fi
-            }
-            
             # ============================================
             # Snyk Security Scanning Section
             # ============================================
@@ -665,7 +630,7 @@ jobs:
             snyk code test --json > "$code_json_file" 2>/tmp/snyk-code-errors.log || true
             
             # Create issues from SAST scan results
-            create_issues_from_snyk_json "$code_json_file" "code" "$branch"
+            python3 /tmp/consolidate_issues.py "$code_json_file" "code" "$branch"
             
             # Also run with --report for Snyk UI
             snyk code test \
@@ -680,7 +645,7 @@ jobs:
             snyk test --all-projects --json > "$sca_json_file" 2>/tmp/snyk-sca-errors.log || true
             
             # Create issues from SCA scan results
-            create_issues_from_snyk_json "$sca_json_file" "SCA" "$branch (all projects)"
+            python3 /tmp/consolidate_issues.py "$sca_json_file" "SCA" "$branch"
             
             # Also run with --report for Snyk UI
             snyk test --all-projects \
@@ -725,7 +690,7 @@ jobs:
                     --json > "$container_json_file" 2>/tmp/snyk-container-$image_name-errors.log || true
                   
                   # Create issues from container scan results
-                  create_issues_from_snyk_json "$container_json_file" "container" "$image_name:latest ($dockerfile)"
+                  python3 /tmp/consolidate_issues.py "$container_json_file" "container" "$image_name:latest ($dockerfile)"
                   
                   # Still run with report for Snyk UI
                   snyk container test "$image_name:latest" \
@@ -773,7 +738,7 @@ jobs:
                           --json > "$base_container_json_file" 2>/tmp/snyk-container-base-$base_image-errors.log || true
                         
                         # Create issues from base image scan results
-                        create_issues_from_snyk_json "$base_container_json_file" "container" "$base_image (base for $dockerfile)"
+                        python3 /tmp/consolidate_issues.py "$base_container_json_file" "container" "$base_image (base for $dockerfile)"
                         
                         # Still run with report for Snyk UI
                         snyk container test "$base_image" \
